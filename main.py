@@ -378,7 +378,50 @@ async def broadcast_start(callback: CallbackQuery, state: FSMContext):
     )
     await state.set_state(BroadcastState.waiting_for_message)
 
+@router.message(Command("stats"))
+async def admin_stats(message: Message):
+    # Check if admin
+    if message.from_user.id not in ADMIN_IDS:
+        return
 
+    try:
+        # 1. Total Users
+        users_count = len(supabase.table("bot_users").select("user_id", count='exact').execute().data)
+
+        # 2. Total Orders
+        all_orders = supabase.table("orders").select("plan_key, amount_paise, status").execute().data
+        total_orders = len(all_orders)
+
+        # 3. Revenue Calculation
+        revenue_by_plan = {"gold": 0, "silver": 0, "bronze": 0, "iron": 0}
+        total_revenue = 0
+
+        for order in all_orders:
+            if order["status"] == "paid":
+                amount = order["amount_paise"] / 100
+                plan = order["plan_key"]
+                if plan in revenue_by_plan:
+                    revenue_by_plan[plan] += amount
+                    total_revenue += amount
+
+        stats_text = (
+            "📊 <b>Admin Dashboard - Statistics</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 Total Users: <b>{users_count}</b>\n"
+            f"📦 Total Orders Created: <b>{total_orders}</b>\n\n"
+            "💰 <b>Total Revenue: ₹{:.2f}</b>\n\n"
+            "<u>Revenue by Plan:</u>\n"
+            f"⚡ Gold: ₹{revenue_by_plan['gold']:.2f}\n"
+            f"⚡ Silver: ₹{revenue_by_plan['silver']:.2f}\n"
+            f"⚡ Bronze: ₹{revenue_by_plan['bronze']:.2f}\n"
+            f"⚡ Iron: ₹{revenue_by_plan['iron']:.2f}"
+        )
+        
+        await message.answer(stats_text, parse_mode=ParseMode.HTML)
+        
+    except Exception as e:
+        logger.exception("Error fetching stats")
+        await message.answer("❌ Stats fetch karne me error aaya.")
 @router.message(BroadcastState.waiting_for_message)
 async def broadcast_send(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
