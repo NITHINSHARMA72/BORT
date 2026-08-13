@@ -42,7 +42,7 @@ RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 
-# Admin IDs for Broadcast (Comma separated user IDs in .env like ADMIN_IDS=12345678,87654321)
+# Admin IDs for Broadcast
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
@@ -277,7 +277,7 @@ def verify_webhook(raw_body: bytes, received_signature: str) -> bool:
 
 
 # =========================
-# TELEGRAM UI & HANDLERS
+# TELEGRAM UI & KEYBOARDS
 # =========================
 def support_url():
     return f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"
@@ -316,8 +316,8 @@ def payment_keyboard(plan_key: str):
     )
 
 
-async def send_home(message_or_callback):
-    user_id = message_or_callback.from_user.id
+async def show_home(callback: CallbackQuery):
+    user_id = callback.from_user.id
     is_admin = user_id in ADMIN_IDS
     text = (
         "👋 <b>Welcome to DARK STORE!</b>\n"
@@ -331,22 +331,36 @@ async def send_home(message_or_callback):
         f"💬 Support: {SUPPORT_USERNAME}\n\n"
         "🤖 <i>Powered by Telegram Store Bot</i>"
     )
-    if isinstance(message_or_callback, Message):
-        await message_or_callback.answer(text, reply_markup=main_keyboard(is_admin))
-    else:
-        await message_or_callback.message.edit_text(text, reply_markup=main_keyboard(is_admin))
+    try:
+        await callback.message.edit_text(text, reply_markup=main_keyboard(is_admin))
+    except Exception:
+        await callback.message.answer(text, reply_markup=main_keyboard(is_admin))
 
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
     save_user(message.from_user.id, message.from_user.username or "", message.from_user.first_name or "")
-    await send_home(message)
+    user_id = message.from_user.id
+    is_admin = user_id in ADMIN_IDS
+    text = (
+        "👋 <b>Welcome to DARK STORE!</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "<blockquote><b>Channels:</b>\n"
+        "⚡ Gold Dark (Channel 1)\n"
+        "⚡ Silver Dark (Channel 2)\n"
+        "⚡ Bronze Dark (Channel 3)\n"
+        "⚡ Iron Dark (Channel 4)</blockquote>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"💬 Support: {SUPPORT_USERNAME}\n\n"
+        "🤖 <i>Powered by Telegram Store Bot</i>"
+    )
+    await message.answer(text, reply_markup=main_keyboard(is_admin))
 
 
 @router.callback_query(F.data == "home")
 async def home_callback(callback: CallbackQuery):
     await callback.answer()
-    await send_home(callback)
+    await show_home(callback)
 
 
 @router.callback_query(F.data == "admin_broadcast")
@@ -355,9 +369,12 @@ async def broadcast_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ You are not authorized!", show_alert=True)
         return
     await callback.answer()
-    await callback.message.answer(
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Back", callback_data="home")]])
+    await callback.message.edit_text(
         "📢 <b>Broadcast Setup</b>\n\n"
-        "Apna message bhejein (Aap <b>Image</b> sath me caption ke roop me ya sirf <b>Text</b> bhej sakte hain)."
+        "Apna message bhejein (Aap <b>Image</b> sath me caption ke roop me ya sirf <b>Text</b> bhej sakte hain).",
+        reply_markup=kb
     )
     await state.set_state(BroadcastState.waiting_for_message)
 
@@ -386,7 +403,7 @@ async def broadcast_send(message: Message, state: FSMContext):
             else:
                 await bot.send_message(chat_id=user_id, text=message.text, parse_mode=ParseMode.HTML)
             success += 1
-            await asyncio.sleep(0.05)  # Telegram rate limit avoid karne ke liye
+            await asyncio.sleep(0.05)
         except Exception:
             failed += 1
 
@@ -402,12 +419,12 @@ async def plan_callback(callback: CallbackQuery):
     await callback.answer()
     plan_key = callback.data.split(":", 1)[1]
     if plan_key not in PLANS:
-        await callback.message.answer("❌ Invalid plan.")
+        await callback.answer("❌ Invalid plan.", show_alert=True)
         return
 
     plan = PLANS[plan_key]
     text = f"<b>{plan['name']}</b>\n━━━━━━━━━━━━━━━━━━\n\nSelect your plan:"
-    await callback.message.answer(text, reply_markup=plan_keyboard(plan_key))
+    await callback.message.edit_text(text, reply_markup=plan_keyboard(plan_key))
 
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -415,14 +432,14 @@ async def buy_callback(callback: CallbackQuery):
     await callback.answer("Generating dynamic QR code…")
     plan_key = callback.data.split(":", 1)[1]
     if plan_key not in PLANS:
-        await callback.message.answer("❌ Invalid plan.")
+        await callback.answer("❌ Invalid plan.", show_alert=True)
         return
 
     try:
         result = await create_payment_link(callback.from_user.id, plan_key)
     except Exception:
         logger.exception("Payment link creation failed")
-        await callback.message.answer("❌ Payment QR create nahi ho paya. Thodi der baad try karein.")
+        await callback.answer("❌ Payment QR create nahi ho paya.", show_alert=True)
         return
 
     plan = PLANS[plan_key]
@@ -445,6 +462,12 @@ async def buy_callback(callback: CallbackQuery):
         "📱 <b>GPay / PhonePe / Paytm / UPI app se scan karein.</b>\n\n"
         "⏱️ Payment hone ke baad <b>Check Payment</b> dabayein."
     )
+
+    # Delete photo/old message safely and send new QR photo
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
 
     await callback.message.answer_photo(
         photo=qr_file,
@@ -517,18 +540,19 @@ async def process_paid_event(event: dict):
 @router.callback_query(F.data == "myplan")
 async def myplan_callback(callback: CallbackQuery):
     await callback.answer()
-    await send_my_plan(callback.message)
+    await send_my_plan(callback)
 
 
 @router.message(Command("myplan"))
 async def myplan_message(message: Message):
-    await send_my_plan(message)
-
-
-async def send_my_plan(message: Message):
+    # For command text, simulate callback object wrapper or handle via message edit/send
     order = get_latest_order(message.from_user.id)
+    is_admin = message.from_user.id in ADMIN_IDS
+
     if not order:
-        await message.answer("📋 <b>My Plan</b>\n\nAapka koi order nahi mila.", reply_markup=main_keyboard(message.from_user.id in ADMIN_IDS))
+        text = "📋 <b>My Plan</b>\n━━━━━━━━━━━━━━━━━━\n\n❌ <b>You have no plans!</b>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Back", callback_data="home")]])
+        await message.answer(text, reply_markup=kb)
         return
 
     plan = PLANS.get(order["plan_key"], {})
@@ -549,14 +573,53 @@ async def send_my_plan(message: Message):
         )
         await message.answer(text, reply_markup=kb)
     else:
-        await message.answer(
+        text = (
             "📋 <b>My Plan</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             f"📦 Plan: <b>{plan.get('name', order['plan_key'])}</b>\n"
             f"💰 Amount: <b>₹{order['amount_paise'] / 100:.2f}</b>\n"
-            "📌 Status: <b>CREATED</b>\n\nPayment complete nahi hua hai.",
-            reply_markup=main_keyboard(message.from_user.id in ADMIN_IDS),
+            "📌 Status: <b>CREATED</b>\n\nPayment complete nahi hua hai."
         )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Back", callback_data="home")]])
+        await message.answer(text, reply_markup=kb)
+
+
+async def send_my_plan(callback: CallbackQuery):
+    order = get_latest_order(callback.from_user.id)
+
+    if not order:
+        text = "📋 <b>My Plan</b>\n━━━━━━━━━━━━━━━━━━\n\n❌ <b>You have no plans!</b>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Back", callback_data="home")]])
+        await callback.message.edit_text(text, reply_markup=kb)
+        return
+
+    plan = PLANS.get(order["plan_key"], {})
+    if order["status"] == "paid":
+        text = (
+            "📋 <b>My Plan</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"📦 Plan: <b>{plan.get('name', order['plan_key'])}</b>\n"
+            f"💰 Amount: <b>₹{order['amount_paise'] / 100:.2f}</b>\n"
+            "📌 Status: <b>PAID</b>\n"
+            f"🧾 Payment ID: <code>{order.get('payment_id') or '-'}</code>\n\n"
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔗 Send Access Link", callback_data=f"access:{order['reference_id']}")],
+                [InlineKeyboardButton(text="↩️ Back", callback_data="home")],
+            ]
+        )
+        await callback.message.edit_text(text, reply_markup=kb)
+    else:
+        text = (
+            "📋 <b>My Plan</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"📦 Plan: <b>{plan.get('name', order['plan_key'])}</b>\n"
+            f"💰 Amount: <b>₹{order['amount_paise'] / 100:.2f}</b>\n"
+            "📌 Status: <b>CREATED</b>\n\nPayment complete nahi hua hai."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Back", callback_data="home")]])
+        await callback.message.edit_text(text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("access:"))
@@ -566,17 +629,18 @@ async def access_callback(callback: CallbackQuery):
     order = get_order(reference_id)
 
     if not order or order["user_id"] != callback.from_user.id:
-        await callback.message.answer("❌ Order not found.")
+        await callback.answer("❌ Order not found.", show_alert=True)
         return
 
     if order["status"] != "paid":
-        await callback.message.answer("❌ Payment abhi confirmed nahi hai.")
+        await callback.answer("❌ Payment abhi confirmed nahi hai.", show_alert=True)
         return
 
     try:
         await deliver_access(order)
+        await callback.answer("✅ Access sent successfully!", show_alert=True)
     except Exception:
-        await callback.message.answer(f"❌ Access send nahi ho paya. Contact {SUPPORT_USERNAME}.")
+        await callback.answer(f"❌ Access send nahi ho paya.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("check:"))
@@ -584,8 +648,12 @@ async def check_payment_callback(callback: CallbackQuery):
     await callback.answer("Checking payment…")
     order = get_latest_order(callback.from_user.id)
 
-    if not order or order["status"] == "paid":
-        await callback.message.answer("✅ Payment already confirmed. /myplan se access le sakte hain.")
+    if not order:
+        await callback.answer("❌ You have no plans!", show_alert=True)
+        return
+
+    if order["status"] == "paid":
+        await callback.answer("✅ Payment already confirmed!", show_alert=True)
         return
 
     try:
@@ -596,10 +664,14 @@ async def check_payment_callback(callback: CallbackQuery):
             mark_paid(order["reference_id"], payment_id)
             updated = get_order(order["reference_id"])
             await deliver_access(updated)
+            await callback.answer("✅ Payment verified!", show_alert=True)
+            # Refresh My Plan view automatically
+            await send_my_plan(callback)
         else:
-            await callback.message.answer(f"⏳ Payment status: <b>{result.get('status', 'unknown')}</b>")
+            status_text = result.get('status', 'unknown')
+            await callback.answer(f"⏳ Status: {status_text}. Payment pending.", show_alert=True)
     except Exception:
-        await callback.message.answer("❌ Payment status check nahi ho paya.")
+        await callback.answer("❌ Payment status check nahi ho paya.", show_alert=True)
 
 
 # =========================
