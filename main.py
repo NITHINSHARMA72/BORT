@@ -6,9 +6,7 @@ import json
 import logging
 import os
 import secrets
-import sqlite3
 import time
-from contextlib import closing
 from typing import Optional
 
 import aiohttp
@@ -17,9 +15,12 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 import qrcode
+from supabase import create_client, Client
 
 load_dotenv()
 
@@ -37,12 +38,17 @@ RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
+# Supabase Config
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+
+# Admin IDs for Broadcast (Comma separated user IDs in .env like ADMIN_IDS=12345678,87654321)
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-# Render supplies PORT automatically for web services.
 WEBHOOK_PORT = int(os.getenv("PORT", os.getenv("WEBHOOK_PORT", "10000")))
 
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@Help_desk3_bot").strip()
-DB_PATH = os.getenv("DB_PATH", "store.db").strip()
 
 PLANS = {
     "gold": {
@@ -77,149 +83,133 @@ PLANS = {
 
 router = Router()
 bot: Optional[Bot] = None
+supabase: Optional[Client] = None
 
 
 # =========================
-# DATABASE
+# FSM FOR BROADCAST
 # =========================
-def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+class BroadcastState(StatesGroup):
+    waiting_for_message = State()
 
 
-def init_db():
-    with closing(db()) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS orders (
-                reference_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                plan_key TEXT NOT NULL,
-                amount_paise INTEGER NOT NULL,
-                payment_link_id TEXT,
-                payment_link_url TEXT,
-                status TEXT NOT NULL DEFAULT 'created',
-                payment_id TEXT,
-                created_at INTEGER NOT NULL,
-                paid_at INTEGER,
-                access_sent INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS processed_events (
-                event_id TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL
-            )
-            """
-        )
-        conn.commit()
+# =========================
+# SUPABASE DATABASE HELPERS
+# =========================
+def init_supabase():
+    global supabase
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY environment variables!")
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def save_user(user_id: int, username: str, first_name: str):
+    try:
+        supabase.table("bot_users").upsert({
+            "user_id": user_id,
+            "username": username,
+            "first_name": first_name,
+            "created_at": int(time.time())
+        }, on_conflict="user_id").execute()
+    except Exception:
+        logger.exception("Failed to save user")
 
 
 def save_order(reference_id, user_id, plan_key, amount_paise, payment_link_id, payment_link_url):
-    with closing(db()) as conn:
-        conn.execute(
-            """
-            INSERT INTO orders
-            (reference_id, user_id, plan_key, amount_paise, payment_link_id,
-             payment_link_url, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'created', ?)
-            """,
-            (
-                reference_id,
-                user_id,
-                plan_key,
-                amount_paise,
-                payment_link_id,
-                payment_link_url,
-                int(time.time()),
-            ),
-        )
-        conn.commit()
+    try:
+        supabase.table("orders").insert({
+            "reference_id": reference_id,
+            "user_id": user_id,
+            "plan_key": plan_key,
+            "amount_paise": amount_paise,
+            "payment_link_id": payment_link_id,
+            "payment_link_url": payment_link_url,
+            "status": "created",
+            "created_at": int(time.time()),
+            "access_sent": 0
+        }).execute()
+    except Exception:
+        logger.exception("Failed to save order")
 
 
 def get_order(reference_id):
-    with closing(db()) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM orders WHERE reference_id = ?", (reference_id,)
-        ).fetchone()
-        return dict(row) if row else None
+    try:
+        res = supabase.table("orders").select("*").eq("reference_id", reference_id).execute()
+        return res.data[0] if res.data else None
+    except Exception:
+        logger.exception("Failed to get order")
+        return None
 
 
 def get_latest_order(user_id):
-    with closing(db()) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            SELECT * FROM orders
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            (user_id,),
-        ).fetchone()
-        return dict(row) if row else None
+    try:
+        res = supabase.table("orders").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(1).execute()
+        return res.data[0] if res.data else None
+    except Exception:
+        logger.exception("Failed to get latest order")
+        return None
 
 
 def mark_paid(reference_id, payment_id):
-    with closing(db()) as conn:
-        conn.execute(
-            """
-            UPDATE orders
-            SET status = 'paid', payment_id = ?, paid_at = ?
-            WHERE reference_id = ?
-            """,
-            (payment_id, int(time.time()), reference_id),
-        )
-        conn.commit()
+    try:
+        supabase.table("orders").update({
+            "status": "paid",
+            "payment_id": payment_id,
+            "paid_at": int(time.time())
+        }).eq("reference_id", reference_id).execute()
+    except Exception:
+        logger.exception("Failed to mark order paid")
 
 
 def mark_access_sent(reference_id):
-    with closing(db()) as conn:
-        conn.execute(
-            "UPDATE orders SET access_sent = 1 WHERE reference_id = ?",
-            (reference_id,),
-        )
-        conn.commit()
+    try:
+        supabase.table("orders").update({"access_sent": 1}).eq("reference_id", reference_id).execute()
+    except Exception:
+        logger.exception("Failed to mark access sent")
 
 
 def event_already_processed(event_id):
     if not event_id:
         return False
-    with closing(db()) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM processed_events WHERE event_id = ?", (event_id,)
-        ).fetchone()
-        return bool(row)
+    try:
+        res = supabase.table("processed_events").select("event_id").eq("event_id", event_id).execute()
+        return len(res.data) > 0
+    except Exception:
+        return False
 
 
 def save_event(event_id):
     if not event_id:
         return
-    with closing(db()) as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO processed_events (event_id, created_at) VALUES (?, ?)",
-            (event_id, int(time.time())),
-        )
-        conn.commit()
+    try:
+        supabase.table("processed_events").insert({
+            "event_id": event_id,
+            "created_at": int(time.time())
+        }).execute()
+    except Exception:
+        pass
+
+
+def get_all_users():
+    try:
+        res = supabase.table("bot_users").select("user_id").execute()
+        return [row["user_id"] for row in res.data]
+    except Exception:
+        logger.exception("Failed to fetch users for broadcast")
+        return []
 
 
 # =========================
-# RAZORPAY
+# RAZORPAY CONFIG & API
 # =========================
-def validate_razorpay_config():
+def validate_config():
     missing = []
-    if not BOT_TOKEN:
-        missing.append("BOT_TOKEN")
-    if not RAZORPAY_KEY_ID:
-        missing.append("RAZORPAY_KEY_ID")
-    if not RAZORPAY_KEY_SECRET:
-        missing.append("RAZORPAY_KEY_SECRET")
-    if not RAZORPAY_WEBHOOK_SECRET:
-        missing.append("RAZORPAY_WEBHOOK_SECRET")
+    if not BOT_TOKEN: missing.append("BOT_TOKEN")
+    if not RAZORPAY_KEY_ID: missing.append("RAZORPAY_KEY_ID")
+    if not RAZORPAY_KEY_SECRET: missing.append("RAZORPAY_KEY_SECRET")
+    if not RAZORPAY_WEBHOOK_SECRET: missing.append("RAZORPAY_WEBHOOK_SECRET")
+    if not SUPABASE_URL: missing.append("SUPABASE_URL")
+    if not SUPABASE_KEY: missing.append("SUPABASE_KEY")
     if missing:
         raise RuntimeError("Missing environment variables: " + ", ".join(missing))
 
@@ -278,34 +268,33 @@ async def create_payment_link(user_id: int, plan_key: str):
 def verify_webhook(raw_body: bytes, received_signature: str) -> bool:
     if not RAZORPAY_WEBHOOK_SECRET or not received_signature:
         return False
-
     expected = hmac.new(
         RAZORPAY_WEBHOOK_SECRET.encode("utf-8"),
         raw_body,
         hashlib.sha256,
     ).hexdigest()
-
     return hmac.compare_digest(expected, received_signature)
 
 
 # =========================
-# TELEGRAM UI
+# TELEGRAM UI & HANDLERS
 # =========================
 def support_url():
     return f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"
 
 
-def main_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⚡ Gold Dark (Channel 1)", callback_data="plan:gold")],
-            [InlineKeyboardButton(text="⚡ Silver Dark (Channel 2)", callback_data="plan:silver")],
-            [InlineKeyboardButton(text="⚡ Bronze Dark (Channel 3)", callback_data="plan:bronze")],
-            [InlineKeyboardButton(text="⚡ Iron Dark (Channel 4)", callback_data="plan:iron")],
-            [InlineKeyboardButton(text="📋 My Plan", callback_data="myplan")],
-            [InlineKeyboardButton(text="📞 Support", url=support_url())],
-        ]
-    )
+def main_keyboard(is_admin: bool = False):
+    kb = [
+        [InlineKeyboardButton(text="⚡ Gold Dark (Channel 1)", callback_data="plan:gold")],
+        [InlineKeyboardButton(text="⚡ Silver Dark (Channel 2)", callback_data="plan:silver")],
+        [InlineKeyboardButton(text="⚡ Bronze Dark (Channel 3)", callback_data="plan:bronze")],
+        [InlineKeyboardButton(text="⚡ Iron Dark (Channel 4)", callback_data="plan:iron")],
+        [InlineKeyboardButton(text="📋 My Plan", callback_data="myplan")],
+        [InlineKeyboardButton(text="📞 Support", url=support_url())],
+    ]
+    if is_admin:
+        kb.append([InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
 def plan_keyboard(plan_key: str):
@@ -327,7 +316,9 @@ def payment_keyboard(plan_key: str):
     )
 
 
-async def send_home(chat_id: int):
+async def send_home(message_or_callback):
+    user_id = message_or_callback.from_user.id
+    is_admin = user_id in ADMIN_IDS
     text = (
         "👋 <b>Welcome to DARK STORE!</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
@@ -340,25 +331,76 @@ async def send_home(chat_id: int):
         f"💬 Support: {SUPPORT_USERNAME}\n\n"
         "🤖 <i>Powered by Telegram Store Bot</i>"
     )
-    await bot.send_message(chat_id, text, reply_markup=main_keyboard())
+    if isinstance(message_or_callback, Message):
+        await message_or_callback.answer(text, reply_markup=main_keyboard(is_admin))
+    else:
+        await message_or_callback.message.edit_text(text, reply_markup=main_keyboard(is_admin))
 
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
-    await send_home(message.chat.id)
+    save_user(message.from_user.id, message.from_user.username or "", message.from_user.first_name or "")
+    await send_home(message)
 
 
 @router.callback_query(F.data == "home")
 async def home_callback(callback: CallbackQuery):
     await callback.answer()
-    await send_home(callback.message.chat.id)
+    await send_home(callback)
+
+
+@router.callback_query(F.data == "admin_broadcast")
+async def broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ You are not authorized!", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.answer(
+        "📢 <b>Broadcast Setup</b>\n\n"
+        "Apna message bhejein (Aap <b>Image</b> sath me caption ke roop me ya sirf <b>Text</b> bhej sakte hain)."
+    )
+    await state.set_state(BroadcastState.waiting_for_message)
+
+
+@router.message(BroadcastState.waiting_for_message)
+async def broadcast_send(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        await state.clear()
+        return
+
+    await state.clear()
+    users = get_all_users()
+    
+    status_msg = await message.answer(f"🚀 Broadcast started to {len(users)} users...")
+    success, failed = 0, 0
+
+    for user_id in users:
+        try:
+            if message.photo:
+                await bot.send_photo(
+                    chat_id=user_id,
+                    photo=message.photo[-1].file_id,
+                    caption=message.caption or "",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await bot.send_message(chat_id=user_id, text=message.text, parse_mode=ParseMode.HTML)
+            success += 1
+            await asyncio.sleep(0.05)  # Telegram rate limit avoid karne ke liye
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(
+        f"✅ <b>Broadcast Completed!</b>\n\n"
+        f"📤 Successful: <b>{success}</b>\n"
+        f"❌ Failed: <b>{failed}</b>"
+    )
 
 
 @router.callback_query(F.data.startswith("plan:"))
 async def plan_callback(callback: CallbackQuery):
     await callback.answer()
     plan_key = callback.data.split(":", 1)[1]
-
     if plan_key not in PLANS:
         await callback.message.answer("❌ Invalid plan.")
         return
@@ -372,7 +414,6 @@ async def plan_callback(callback: CallbackQuery):
 async def buy_callback(callback: CallbackQuery):
     await callback.answer("Generating dynamic QR code…")
     plan_key = callback.data.split(":", 1)[1]
-
     if plan_key not in PLANS:
         await callback.message.answer("❌ Invalid plan.")
         return
@@ -381,22 +422,13 @@ async def buy_callback(callback: CallbackQuery):
         result = await create_payment_link(callback.from_user.id, plan_key)
     except Exception:
         logger.exception("Payment link creation failed")
-        await callback.message.answer(
-            "❌ Payment QR create nahi ho paya.\n"
-            "Thodi der baad try karein ya Support se contact karein."
-        )
+        await callback.message.answer("❌ Payment QR create nahi ho paya. Thodi der baad try karein.")
         return
 
     plan = PLANS[plan_key]
     payment_url = result["short_url"]
 
-    # Dynamic QR contains the unique Razorpay Payment Link URL.
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=10,
-        border=4,
-    )
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=4)
     qr.add_data(payment_url)
     qr.make(fit=True)
 
@@ -410,8 +442,8 @@ async def buy_callback(callback: CallbackQuery):
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"📦 Plan: <b>{plan['name']}</b>\n"
         f"💰 Amount: <b>₹{plan['price']}</b>\n\n"
-        "📱 <b>GPay / PhonePe / Paytm / any supported UPI app se QR scan karein.</b>\n\n"
-        "⏱️ Payment complete hone ke baad neeche <b>Check Payment</b> dabayein."
+        "📱 <b>GPay / PhonePe / Paytm / UPI app se scan karein.</b>\n\n"
+        "⏱️ Payment hone ke baad <b>Check Payment</b> dabayein."
     )
 
     await callback.message.answer_photo(
@@ -423,17 +455,12 @@ async def buy_callback(callback: CallbackQuery):
 
 async def make_access_link(plan_key: str) -> Optional[str]:
     plan = PLANS[plan_key]
-
     if plan["channel_id"]:
         try:
-            invite = await bot.create_chat_invite_link(
-                chat_id=plan["channel_id"],
-                member_limit=1,
-            )
+            invite = await bot.create_chat_invite_link(chat_id=plan["channel_id"], member_limit=1)
             return invite.invite_link
         except Exception:
             logger.exception("Invite link creation failed for %s", plan_key)
-
     return plan["access_link"] or None
 
 
@@ -442,13 +469,10 @@ async def deliver_access(order: dict):
         return True
 
     access_link = await make_access_link(order["plan_key"])
-
     if not access_link:
         await bot.send_message(
             order["user_id"],
-            "✅ <b>Payment confirmed.</b>\n\n"
-            "Lekin access link configure nahi hai.\n"
-            f"📞 Support: {SUPPORT_USERNAME}",
+            f"✅ <b>Payment confirmed.</b>\n\nLekin access link configure nahi hai.\n📞 Support: {SUPPORT_USERNAME}",
         )
         return False
 
@@ -473,12 +497,10 @@ async def process_paid_event(event: dict):
 
     reference_id = pl.get("reference_id")
     if not reference_id:
-        logger.warning("payment_link.paid event has no reference_id")
         return
 
     order = get_order(reference_id)
     if not order:
-        logger.warning("Order not found for reference_id=%s", reference_id)
         return
 
     payment_id = payment.get("id") or ""
@@ -505,17 +527,11 @@ async def myplan_message(message: Message):
 
 async def send_my_plan(message: Message):
     order = get_latest_order(message.from_user.id)
-
     if not order:
-        await message.answer(
-            "📋 <b>My Plan</b>\n\nAapka koi order nahi mila.",
-            reply_markup=main_keyboard(),
-        )
+        await message.answer("📋 <b>My Plan</b>\n\nAapka koi order nahi mila.", reply_markup=main_keyboard(message.from_user.id in ADMIN_IDS))
         return
 
     plan = PLANS.get(order["plan_key"], {})
-    status = order["status"].upper()
-
     if order["status"] == "paid":
         text = (
             "📋 <b>My Plan</b>\n"
@@ -524,7 +540,6 @@ async def send_my_plan(message: Message):
             f"💰 Amount: <b>₹{order['amount_paise'] / 100:.2f}</b>\n"
             "📌 Status: <b>PAID</b>\n"
             f"🧾 Payment ID: <code>{order.get('payment_id') or '-'}</code>\n\n"
-            "Access lene ke liye neeche button dabayein."
         )
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -539,9 +554,8 @@ async def send_my_plan(message: Message):
             "━━━━━━━━━━━━━━━━━━\n\n"
             f"📦 Plan: <b>{plan.get('name', order['plan_key'])}</b>\n"
             f"💰 Amount: <b>₹{order['amount_paise'] / 100:.2f}</b>\n"
-            f"📌 Status: <b>{status}</b>\n\n"
-            "Payment complete nahi hua hai.",
-            reply_markup=main_keyboard(),
+            "📌 Status: <b>CREATED</b>\n\nPayment complete nahi hua hai.",
+            reply_markup=main_keyboard(message.from_user.id in ADMIN_IDS),
         )
 
 
@@ -562,7 +576,6 @@ async def access_callback(callback: CallbackQuery):
     try:
         await deliver_access(order)
     except Exception:
-        logger.exception("Manual access delivery failed")
         await callback.message.answer(f"❌ Access send nahi ho paya. Contact {SUPPORT_USERNAME}.")
 
 
@@ -571,51 +584,32 @@ async def check_payment_callback(callback: CallbackQuery):
     await callback.answer("Checking payment…")
     order = get_latest_order(callback.from_user.id)
 
-    if not order:
-        await callback.message.answer("❌ Order not found.")
-        return
-
-    if order["status"] == "paid":
+    if not order or order["status"] == "paid":
         await callback.message.answer("✅ Payment already confirmed. /myplan se access le sakte hain.")
-        return
-
-    if not order["payment_link_id"]:
-        await callback.message.answer("❌ Payment link not found.")
         return
 
     try:
         result = await razorpay_request("GET", f"payment_links/{order['payment_link_id']}")
         if result.get("status") == "paid":
-            payment_id = ""
             payments = result.get("payments") or []
-            if isinstance(payments, list) and payments:
-                payment_id = payments[0].get("payment_id") or payments[0].get("id") or ""
-            elif isinstance(payments, dict):
-                payment_id = payments.get("payment_id") or payments.get("id") or ""
-
+            payment_id = payments[0].get("payment_id") or payments[0].get("id") if payments else ""
             mark_paid(order["reference_id"], payment_id)
             updated = get_order(order["reference_id"])
             await deliver_access(updated)
         else:
-            await callback.message.answer(
-                f"⏳ Payment status: <b>{result.get('status', 'unknown')}</b>\n"
-                "Agar aapne payment kar diya hai, thodi der baad dobara check karein."
-            )
+            await callback.message.answer(f"⏳ Payment status: <b>{result.get('status', 'unknown')}</b>")
     except Exception:
-        logger.exception("Payment status check failed")
-        await callback.message.answer("❌ Payment status check nahi ho paya. Thodi der baad try karein.")
+        await callback.message.answer("❌ Payment status check nahi ho paya.")
 
 
 # =========================
-# RAZORPAY WEBHOOK SERVER
+# WEBHOOK SERVER
 # =========================
 async def razorpay_webhook(request: web.Request):
     raw_body = await request.read()
     signature = request.headers.get("X-Razorpay-Signature", "")
 
-    # Never bypass webhook verification in production.
     if not verify_webhook(raw_body, signature):
-        logger.warning("Invalid Razorpay webhook signature")
         return web.Response(status=400, text="invalid signature")
 
     event_id = request.headers.get("x-razorpay-event-id", "")
@@ -650,7 +644,6 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, WEBHOOK_HOST, WEBHOOK_PORT)
     await site.start()
-
     logger.info("HTTP server listening on %s:%s", WEBHOOK_HOST, WEBHOOK_PORT)
     return runner
 
@@ -660,14 +653,10 @@ async def start_web_server():
 # =========================
 async def main():
     global bot
+    validate_config()
+    init_supabase()
 
-    validate_razorpay_config()
-    init_db()
-
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
 
