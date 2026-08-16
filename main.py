@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import hmac
 import io
@@ -42,9 +43,12 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
-RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
+PAYU_KEY = os.getenv("PAYU_KEY", "").strip()
+PAYU_SALT = os.getenv("PAYU_SALT", "").strip()
+PAYU_ENV = os.getenv("PAYU_ENV", "production").strip().lower()
+PAYU_CALLBACK_BASE_URL = os.getenv("PAYU_CALLBACK_BASE_URL", "").strip().rstrip("/")
+PAYU_S2S_CLIENT_IP = os.getenv("PAYU_S2S_CLIENT_IP", "127.0.0.1").strip()
+PAYU_S2S_DEVICE_INFO = os.getenv("PAYU_S2S_DEVICE_INFO", "Telegram Bot").strip()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
@@ -388,14 +392,14 @@ def validate_config():
     if not BOT_TOKEN:
         missing.append("BOT_TOKEN")
 
-    if not RAZORPAY_KEY_ID:
-        missing.append("RAZORPAY_KEY_ID")
+    if not PAYU_KEY:
+        missing.append("PAYU_KEY")
 
-    if not RAZORPAY_KEY_SECRET:
-        missing.append("RAZORPAY_KEY_SECRET")
+    if not PAYU_SALT:
+        missing.append("PAYU_SALT")
 
-    if not RAZORPAY_WEBHOOK_SECRET:
-        missing.append("RAZORPAY_WEBHOOK_SECRET")
+    if not PAYU_CALLBACK_BASE_URL:
+        missing.append("PAYU_CALLBACK_BASE_URL")
 
     if not SUPABASE_URL:
         missing.append("SUPABASE_URL")
@@ -417,123 +421,262 @@ def validate_config():
 
 
 # ============================================================
-# RAZORPAY
+# PAYU DYNAMIC UPI QR
 # ============================================================
 
-async def razorpay_request(
-    method: str,
-    endpoint: str,
-    payload=None,
-):
-    url = f"https://api.razorpay.com/v1/{endpoint.lstrip('/')}"
-    auth = aiohttp.BasicAuth(
-        RAZORPAY_KEY_ID,
-        RAZORPAY_KEY_SECRET,
+PAYU_PAYMENT_URL = (
+    "https://test.payu.in/_payment"
+    if PAYU_ENV == "test"
+    else "https://secure.payu.in/_payment"
+)
+PAYU_VERIFY_URL = (
+    "https://test.payu.in/merchant/postservice.php?form=2"
+    if PAYU_ENV == "test"
+    else "https://info.payu.in/merchant/postservice.php?form=2"
+)
+
+def sha512_hex(value: str) -> str:
+    return hashlib.sha512(value.encode("utf-8")).hexdigest()
+
+
+def payu_payment_hash(
+    txnid: str,
+    amount: str,
+    productinfo: str,
+    firstname: str,
+    email: str,
+    udf1: str = "",
+    udf2: str = "",
+    udf3: str = "",
+    udf4: str = "",
+    udf5: str = "",
+) -> str:
+    raw = (
+        f"{PAYU_KEY}|{txnid}|{amount}|{productinfo}|{firstname}|{email}|"
+        f"{udf1}|{udf2}|{udf3}|{udf4}|{udf5}||||||{PAYU_SALT}"
     )
+    return sha512_hex(raw)
 
-    timeout = aiohttp.ClientTimeout(total=20)
 
+def payu_command_hash(command: str, var1: str) -> str:
+    return sha512_hex(f"{PAYU_KEY}|{command}|{var1}|{PAYU_SALT}")
+
+
+def verify_payu_response(data: dict) -> bool:
+    received = (data.get("hash") or "").strip().lower()
+    if not received:
+        return False
+
+    additional_charges = data.get("additional_charges") or data.get("additionalCharges")
+    status = data.get("status", "")
+    udf1 = data.get("udf1", "")
+    udf2 = data.get("udf2", "")
+    udf3 = data.get("udf3", "")
+    udf4 = data.get("udf4", "")
+    udf5 = data.get("udf5", "")
+    email = data.get("email", "")
+    firstname = data.get("firstname", "")
+    productinfo = data.get("productinfo", "")
+    amount = data.get("amount", "")
+    txnid = data.get("txnid", "")
+
+    if additional_charges:
+        raw = (
+            f"{additional_charges}|{PAYU_SALT}|{status}||||||"
+            f"{udf5}|{udf4}|{udf3}|{udf2}|{udf1}|{email}|"
+            f"{firstname}|{productinfo}|{amount}|{txnid}|{PAYU_KEY}"
+        )
+    else:
+        raw = (
+            f"{PAYU_SALT}|{status}||||||{udf5}|{udf4}|{udf3}|{udf2}|{udf1}|"
+            f"{email}|{firstname}|{productinfo}|{amount}|{txnid}|{PAYU_KEY}"
+        )
+
+    return hmac.compare_digest(sha512_hex(raw).lower(), received)
+
+
+async def payu_payment_request(payload: dict):
+    timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.request(
-            method,
-            url,
-            auth=auth,
-            json=payload,
+        async with session.post(
+            PAYU_PAYMENT_URL,
+            data=payload,
+            headers={"Accept": "application/json"},
         ) as resp:
             text = await resp.text()
-
             if resp.status >= 400:
-                raise RuntimeError(
-                    f"Razorpay HTTP {resp.status}: {text[:1000]}"
-                )
-
+                raise RuntimeError(f"PayU HTTP {resp.status}: {text[:1000]}")
             try:
                 return json.loads(text)
             except json.JSONDecodeError:
-                raise RuntimeError(
-                    f"Razorpay returned invalid JSON: {text[:500]}"
-                )
+                # PayU may return JSON wrapped in whitespace/HTML in some flows.
+                raise RuntimeError(f"PayU returned non-JSON response: {text[:1000]}")
 
 
-async def create_payment_link(
-    user_id: int,
-    plan_key: str,
-):
+async def create_payment_link(user_id: int, plan_key: str):
     if plan_key not in PLANS:
         raise ValueError("Invalid plan")
 
     plan = PLANS[plan_key]
-
-    amount_paise = int(round(float(plan["price"]) * 100))
+    amount = f"{float(plan['price']):.2f}"
     reference_id = f"{user_id}_{secrets.token_hex(8)}"
+    productinfo = plan["description"]
+    firstname = "TelegramUser"
+    email = f"telegram_{user_id}@example.com"
 
     payload = {
-        "amount": amount_paise,
-        "currency": "INR",
-        "accept_partial": False,
-        "reference_id": reference_id,
-        "description": plan["description"],
-        "notify": {
-            "sms": False,
-            "email": False,
-            "whatsapp": False,
-        },
-        "reminder_enable": False,
-        "notes": {
-            "telegram_user_id": str(user_id),
-            "plan_key": plan_key,
-        },
+        "key": PAYU_KEY,
+        "txnid": reference_id,
+        "amount": amount,
+        "productinfo": productinfo,
+        "firstname": firstname,
+        "email": email,
+        "phone": "9999999999",
+        "surl": f"{PAYU_CALLBACK_BASE_URL}/payu/success",
+        "furl": f"{PAYU_CALLBACK_BASE_URL}/payu/failure",
+        "pg": "DBQR",
+        "bankcode": "UPIDBQR",
+        "s2s_client_ip": PAYU_S2S_CLIENT_IP,
+        "s2s_device_info": PAYU_S2S_DEVICE_INFO,
+        "txn_s2s_flow": "4",
+        "expiry_time": os.getenv("PAYU_QR_EXPIRY_SECONDS", "1800"),
+        "udf1": str(user_id),
+        "udf2": plan_key,
     }
-
-    result = await razorpay_request(
-        "POST",
-        "payment_links",
-        payload,
+    payload["hash"] = payu_payment_hash(
+        reference_id, amount, productinfo, firstname, email,
+        payload["udf1"], payload["udf2"], "", "", "",
     )
 
-    payment_link_id = result.get("id")
-    short_url = result.get("short_url")
+    result = await payu_payment_request(payload)
+    meta = result.get("metaData") or {}
+    result_data = result.get("result") or {}
+    txn_status = str(meta.get("txnStatus") or result.get("status") or "").lower()
+    qr_string = result_data.get("qrString") or result_data.get("qr_string")
+    payment_id = str(result_data.get("paymentId") or meta.get("paymentId") or "")
 
-    if not payment_link_id or not short_url:
-        raise RuntimeError(
-            f"Invalid Razorpay payment-link response: {result}"
-        )
+    if not qr_string:
+        raise RuntimeError(f"Invalid PayU Dynamic QR response: {result}")
+    if txn_status in {"failure", "failed", "error"}:
+        raise RuntimeError(f"PayU QR generation failed: {result}")
 
     save_order(
         reference_id=reference_id,
         user_id=user_id,
         plan_key=plan_key,
-        amount_paise=amount_paise,
-        payment_link_id=payment_link_id,
-        payment_link_url=short_url,
+        amount_paise=int(round(float(plan["price"]) * 100)),
+        payment_link_id=payment_id or reference_id,
+        payment_link_url=qr_string,
     )
 
-    return result
+    return {
+        "txnid": reference_id,
+        "payment_id": payment_id,
+        "qr_string": qr_string,
+        "status": txn_status or "pending",
+    }
 
 
-def verify_webhook(
-    raw_body: bytes,
-    received_signature: str,
-) -> bool:
-    if not RAZORPAY_WEBHOOK_SECRET:
-        return False
+async def fetch_and_validate_payment_link(
+    payment_link_id: str,
+    expected_reference_id: str,
+    expected_amount_paise: int,
+):
+    txnid = expected_reference_id
+    payload = {
+        "key": PAYU_KEY,
+        "command": "verify_payment",
+        "var1": txnid,
+        "hash": payu_command_hash("verify_payment", txnid),
+    }
 
-    if not received_signature:
-        return False
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(PAYU_VERIFY_URL, data=payload) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"PayU verify HTTP {resp.status}: {text[:1000]}")
+            result = json.loads(text)
 
-    expected = hmac.new(
-        RAZORPAY_WEBHOOK_SECRET.encode("utf-8"),
-        raw_body,
-        hashlib.sha256,
-    ).hexdigest()
+    details = (result.get("transaction_details") or {}).get(txnid) or {}
+    status = str(details.get("status") or "").lower()
+    if status == "success":
+        actual_amount = float(details.get("amt") or details.get("amount") or 0)
+        if abs(actual_amount - (expected_amount_paise / 100)) > 0.01:
+            raise RuntimeError("PayU payment amount mismatch.")
+        return result, str(details.get("mihpayid") or details.get("paymentId") or "")
 
-    return hmac.compare_digest(
-        expected,
-        received_signature,
-    )
+    return result, ""
 
 
-# ============================================================
+async def process_payu_callback(data: dict):
+    if not verify_payu_response(data):
+        raise RuntimeError("Invalid PayU response hash")
+
+    txnid = (data.get("txnid") or "").strip()
+    if not txnid:
+        raise RuntimeError("Missing PayU txnid")
+
+    order = get_order(txnid)
+    if not order:
+        logger.warning("PayU callback order not found: %s", txnid)
+        return
+
+    status = str(data.get("status") or "").lower()
+    if status != "success":
+        return
+
+    actual_amount = float(data.get("amount") or 0)
+    if abs(actual_amount - (int(order["amount_paise"]) / 100)) > 0.01:
+        raise RuntimeError("PayU callback amount mismatch")
+
+    payment_id = str(data.get("mihpayid") or data.get("paymentId") or "")
+    updated = await activate_paid_order(order, payment_id)
+    if updated and not updated.get("access_sent"):
+        await deliver_access(updated)
+
+
+async def payu_callback(request: web.Request):
+    try:
+        data = dict(await request.post())
+        if not data:
+            raw = await request.read()
+            raw_text = raw.decode("utf-8", errors="ignore").strip()
+            try:
+                data = json.loads(raw_text)
+            except Exception:
+                # DBQR S2S callbacks can arrive as base64-encoded JSON.
+                try:
+                    decoded = base64.b64decode(raw_text + "===").decode("utf-8")
+                    envelope = json.loads(decoded)
+                    data = envelope.get("result") or envelope
+                except Exception:
+                    data = {}
+
+        # Some PayU callbacks wrap the final transaction in result.
+        if isinstance(data.get("result"), dict) and not data.get("txnid"):
+            data = data["result"]
+
+        await process_payu_callback(data)
+        return web.Response(text="OK", status=200)
+    except Exception:
+        logger.exception("PayU callback processing failed")
+        return web.Response(text="processing failed", status=500)
+
+
+async def payu_verify_callback(request: web.Request):
+    # Browser redirect endpoint; no payment is trusted from redirect alone.
+    try:
+        data = dict(await request.post())
+        if data.get("status") == "success":
+            await process_payu_callback(data)
+            return web.Response(text="Payment received. You can return to Telegram.", status=200)
+        return web.Response(text="Payment not successful. Return to Telegram and retry.", status=200)
+    except Exception:
+        logger.exception("PayU redirect processing failed")
+        return web.Response(text="Payment response received.", status=200)
+
+
 # TELEGRAM UI
 # ============================================================
 
@@ -817,7 +960,7 @@ async def buy_callback(callback: CallbackQuery):
         )
     except Exception:
         logger.exception(
-            "Payment link creation failed"
+            "PayU Dynamic QR creation failed"
         )
         await callback.answer(
             "❌ Payment QR create nahi ho paya.",
@@ -826,10 +969,8 @@ async def buy_callback(callback: CallbackQuery):
         return
 
     plan = PLANS[plan_key]
-    payment_url = result["short_url"]
-
     qr_file = generate_qr_file(
-        payment_url,
+        result["qr_string"],
         "payment_qr.png",
     )
 
@@ -883,10 +1024,10 @@ async def renew_callback(callback: CallbackQuery):
         )
     except Exception:
         logger.exception(
-            "Renewal payment link creation failed"
+            "PayU renewal QR creation failed"
         )
         await callback.answer(
-            "❌ Payment link create nahi ho paya.",
+            "❌ Payment QR create nahi ho paya.",
             show_alert=True,
         )
         return
@@ -894,7 +1035,7 @@ async def renew_callback(callback: CallbackQuery):
     plan = PLANS[plan_key]
 
     qr_file = generate_qr_file(
-        result["short_url"],
+        result["qr_string"],
         "renewal_qr.png",
     )
 
@@ -1068,7 +1209,7 @@ async def deliver_access(order: dict):
 
 
 # ============================================================
-# PAYMENT LINK VALIDATION
+# PAYU PAYMENT VALIDATION
 # ============================================================
 
 async def fetch_and_validate_payment_link(
@@ -1526,212 +1667,9 @@ async def access_callback(
 
 
 # ============================================================
-# RAZORPAY WEBHOOK
+# PAYU CALLBACK
 # ============================================================
 
-def extract_payment_link_event(
-    event: dict,
-):
-    payload = event.get("payload") or {}
-
-    payment_link_entity = (
-        payload.get("payment_link", {})
-        .get("entity", {})
-    )
-
-    payment_entity = (
-        payload.get("payment", {})
-        .get("entity", {})
-    )
-
-    # Some Razorpay payment-link event payloads can expose
-    # order/payment-link information differently. Use the
-    # available entity and then resolve the DB order.
-    if not payment_link_entity:
-        payment_link_entity = (
-            payload.get("order", {})
-            .get("entity", {})
-        )
-
-    reference_id = (
-        payment_link_entity.get("reference_id")
-        or payment_entity.get("reference_id")
-        or payment_entity.get("notes", {}).get(
-            "reference_id"
-        )
-    )
-
-    payment_link_id = (
-        payment_link_entity.get("id")
-        or payment_link_entity.get(
-            "payment_link_id"
-        )
-    )
-
-    payment_id = (
-        payment_entity.get("id")
-        or payment_entity.get("payment_id")
-        or ""
-    )
-
-    return (
-        reference_id,
-        payment_link_id,
-        payment_id,
-    )
-
-
-async def process_paid_event(
-    event: dict,
-):
-    (
-        reference_id,
-        payment_link_id,
-        payment_id,
-    ) = extract_payment_link_event(event)
-
-    if not reference_id and payment_link_id:
-        order = get_order_by_payment_link(
-            payment_link_id
-        )
-    else:
-        order = (
-            get_order(reference_id)
-            if reference_id
-            else None
-        )
-
-    if not order:
-        logger.warning(
-            "Webhook order not found. "
-            "reference_id=%s payment_link_id=%s",
-            reference_id,
-            payment_link_id,
-        )
-        return
-
-    # Never trust webhook payload amount/reference alone.
-    # Fetch the payment link from Razorpay and validate it.
-    actual_payment_link_id = (
-        order["payment_link_id"]
-    )
-
-    result, fetched_payment_id = (
-        await fetch_and_validate_payment_link(
-            actual_payment_link_id,
-            order["reference_id"],
-            order["amount_paise"],
-        )
-    )
-
-    if result.get("status") != "paid":
-        logger.warning(
-            "Webhook received but payment link is not paid: %s",
-            result.get("status"),
-        )
-        return
-
-    payment_id = (
-        fetched_payment_id
-        or payment_id
-        or ""
-    )
-
-    updated = await activate_paid_order(
-        order,
-        payment_id,
-    )
-
-    if not updated:
-        return
-
-    if not updated.get("access_sent"):
-        try:
-            await deliver_access(updated)
-        except Exception:
-            logger.exception(
-                "Access delivery failed"
-            )
-
-
-async def razorpay_webhook(
-    request: web.Request,
-):
-    raw_body = await request.read()
-
-    signature = request.headers.get(
-        "X-Razorpay-Signature",
-        "",
-    )
-
-    if not verify_webhook(
-        raw_body,
-        signature,
-    ):
-        return web.Response(
-            status=400,
-            text="invalid signature",
-        )
-
-    event_id = request.headers.get(
-        "x-razorpay-event-id",
-        "",
-    )
-
-    if event_id and event_already_processed(
-        event_id
-    ):
-        return web.Response(
-            status=200,
-            text="already processed",
-        )
-
-    try:
-        event = json.loads(
-            raw_body.decode("utf-8")
-        )
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return web.Response(
-            status=400,
-            text="invalid json",
-        )
-
-    if event.get("event") != "payment_link.paid":
-        # Ignore unrelated Razorpay webhook events.
-        if event_id:
-            save_event(event_id)
-
-        return web.Response(
-            status=200,
-            text="ignored",
-        )
-
-    try:
-        await process_paid_event(event)
-
-        # Save only after successful processing so a temporary
-        # DB/Razorpay/Telegram failure can be retried by Razorpay.
-        if event_id:
-            save_event(event_id)
-
-        return web.Response(
-            status=200,
-            text="ok",
-        )
-
-    except Exception:
-        logger.exception(
-            "Razorpay webhook processing failed"
-        )
-
-        # Return 500 so Razorpay can retry the webhook.
-        return web.Response(
-            status=500,
-            text="processing failed",
-        )
-
-
-# ============================================================
 # SUBSCRIPTION EXPIRY
 # ============================================================
 
@@ -2109,8 +2047,16 @@ async def start_web_server():
     )
 
     app.router.add_post(
-        "/razorpay/webhook",
-        razorpay_webhook,
+        "/payu/callback",
+        payu_callback,
+    )
+    app.router.add_post(
+        "/payu/success",
+        payu_verify_callback,
+    )
+    app.router.add_post(
+        "/payu/failure",
+        payu_verify_callback,
     )
 
     runner = web.AppRunner(app)
